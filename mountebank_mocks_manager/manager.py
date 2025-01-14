@@ -355,6 +355,9 @@ class MocksManager:
 
     # Methods to override
 
+    def set_log_level(self, log_level: str):
+        logger.setLevel(log_level)
+
     def common_processors(self, recorded_imposters: dict):
         # Override this method to use your own rules for processing imposters
         return CommonProcessor.process(recorded_imposters)
