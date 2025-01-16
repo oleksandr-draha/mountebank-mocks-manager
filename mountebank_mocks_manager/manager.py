@@ -79,6 +79,8 @@ class MocksManager:
             if self.proxy_enabled and not main_test:
                 pytest.skip('Skipping in proxy mode')
 
+        return True
+
         # Extend this method to support custom pytest markers
 
     def get_test_path(self):
