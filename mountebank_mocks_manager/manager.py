@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from filelock import FileLock
+from funcy import select_keys
 from pathvalidate import sanitize_filename
 from pytest import FixtureRequest
 
@@ -17,6 +18,13 @@ from mountebank_mocks_manager.plugins.patchers import patch_some_service
 from mountebank_mocks_manager.plugins.post_processors import PostProcessor
 from mountebank_mocks_manager.plugins.processors import CommonProcessor
 from mountebank_mocks_manager.server import MBServer
+
+
+class ModeNotAllowed(Exception):
+    def __init__(
+        self, message='Semi proxy mode is not allowed in parallel mode', *args, **kwargs
+    ):
+        super().__init__(message, *args, **kwargs)
 
 
 class MocksManager:
@@ -32,6 +40,7 @@ class MocksManager:
         mb_server_host: str = None,
         mb_server_port: int = None,
         proxy_enabled: bool = False,
+        semi_proxies: list | None = None,
         proxy_wait: bool = False,
         proxy_wait_time: int = 1,
         services: dict = None,
@@ -47,6 +56,7 @@ class MocksManager:
 
         # Available markers
         self.proxy_enabled = proxy_enabled
+        self.semi_proxies = semi_proxies or []
         self.proxy_wait = proxy_wait
         self.proxy_wait_time = proxy_wait_time
 
@@ -78,6 +88,11 @@ class MocksManager:
             main_test = marker.kwargs.get('main', False)
             if self.proxy_enabled and not main_test:
                 pytest.skip('Skipping in proxy mode')
+
+        if marker := self.request.node.get_closest_marker(name='semi_proxies'):
+            self.semi_proxies = marker.kwargs.get('imposters', [])
+            if self.parallel_mode and self.semi_proxies:
+                raise ModeNotAllowed()
 
         return True
 
@@ -206,11 +221,16 @@ class MocksManager:
                 )
 
     def set_imposters_from_path(
-        self, imposters_path: str | Path, full_path: bool = False
+        self,
+        imposters_path: str | Path,
+        full_path: bool = False,
+        imposters_names: list[str] | None = None,
     ):
         if not full_path:
             imposters_path = os.path.join(self.imposters_root, imposters_path)
         imposters = self.get_imposters_from_path(imposters_path)
+        if imposters_names:
+            imposters = select_keys(lambda x: x in imposters_names, imposters)
         logger.info(f' Loading mocks from: {imposters_path}')
         for imposter_name, imposter_data in imposters.items():
             imposter_port = imposter_data['port']
@@ -241,6 +261,9 @@ class MocksManager:
     def set_proxy_imposters(self):
         self.set_imposters_from_path('proxies')
 
+    def set_semi_proxy_imposters(self, imposters_names: list[str]):
+        self.set_imposters_from_path('proxies', imposters_names=imposters_names)
+
     def unset_proxy_imposters(self):
         self.unset_imposters_from_path('proxies')
 
@@ -256,7 +279,12 @@ class MocksManager:
         full_imposters_path = os.path.join(test_path, group_name)
         self.unset_imposters_from_path(full_imposters_path)
 
-    def set_imposters(self, group_name: str = '', test_path: str | Path = None):
+    def set_imposters(
+        self,
+        group_name: str = '',
+        test_path: str | Path = None,
+        semi_proxies: list[str] | None = None,
+    ):
         if group_name:
             logger.info(f' Group: **{group_name}**')
         if self.proxy_enabled:
@@ -264,6 +292,11 @@ class MocksManager:
         else:
             self.set_common_imposters()
             self.set_test_imposters(group_name, test_path)
+            semi_proxies = self.semi_proxies + (semi_proxies or [])
+            if semi_proxies:
+                if self.parallel_mode:
+                    raise ModeNotAllowed()
+                self.set_semi_proxy_imposters(semi_proxies)
 
     def unset_imposters(
         self,
@@ -271,20 +304,23 @@ class MocksManager:
         test_path: str | Path = None,
         wait: bool = False,
         rewrite_allowed: bool = True,
+        semi_proxies: list[str] | None = None,
     ):
-        if self.proxy_enabled and rewrite_allowed:
-            logger.info('Creating new imposters based on proxy data')
-            if self.proxy_wait or wait:
-                logger.info(
-                    f'Sleeping {self.proxy_wait_time}s for collecting requests to mocks'
+        semi_proxies = self.semi_proxies + (semi_proxies or [])
+        if self.proxy_enabled:
+            if rewrite_allowed:
+                self.process_imposters(
+                    group_name=group_name, test_path=test_path, wait=wait
                 )
-                time.sleep(self.proxy_wait_time)
-            logger.info('Generating mocks for tests')
-            if test_path is None:
-                test_path = self.test_path
-            full_imposters_path = os.path.join(test_path, group_name)
-            self.process_imposters(full_imposters_path)
             self.unset_proxy_imposters()
+        elif semi_proxies:
+            if self.parallel_mode:
+                raise ModeNotAllowed()
+            if rewrite_allowed:
+                self.process_imposters(
+                    group_name=group_name, test_path=test_path, wait=wait
+                )
+            self.mountebank_server.delete_all_imposters()
         else:
             if self.parallel_mode:
                 self.unset_common_imposters()
@@ -292,7 +328,23 @@ class MocksManager:
             else:
                 self.mountebank_server.delete_all_imposters()
 
-    def process_imposters(self, test_imposters_path: str):
+    def process_imposters(
+        self,
+        group_name: str = '',
+        test_path: str | Path = None,
+        wait: bool = False,
+    ):
+        logger.info('Creating new imposters based on proxy data')
+        if self.proxy_wait or wait:
+            logger.info(
+                f'Sleeping {self.proxy_wait_time}s for collecting requests to mocks'
+            )
+            time.sleep(self.proxy_wait_time)
+        logger.info('Generating mocks for tests')
+        if test_path is None:
+            test_path = self.test_path
+        test_imposters_path = os.path.join(test_path, group_name)
+
         full_imposters_path = os.path.join(self.imposters_root, test_imposters_path)
         raw_imposters_path = os.path.join(full_imposters_path, '_raw')
 
@@ -333,10 +385,11 @@ class MocksManager:
     @contextmanager
     def mocks_group(
         self,
-        group_name='',
-        test_path=None,
-        wait=False,
-        rewrite_allowed=True,
+        group_name: str = '',
+        test_path: str | None = None,
+        wait: bool = False,
+        rewrite_allowed: bool = True,
+        semi_proxies: list[str] | None = None,
         **kwargs,
     ):
         try:
@@ -345,7 +398,9 @@ class MocksManager:
                 if hasattr(self, key):
                     setattr(self, key, value)
 
-            self.set_imposters(group_name=group_name, test_path=test_path)
+            self.set_imposters(
+                group_name=group_name, test_path=test_path, semi_proxies=semi_proxies
+            )
             yield
         finally:
             self.unset_imposters(
@@ -353,6 +408,7 @@ class MocksManager:
                 test_path=test_path,
                 wait=wait,
                 rewrite_allowed=rewrite_allowed,
+                semi_proxies=semi_proxies,
             )
 
     # Methods to override
